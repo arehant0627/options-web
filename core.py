@@ -25,6 +25,28 @@ import yfinance as yf
 
 # Override with the SNAP_DIR env var to persist snapshots (e.g. Google Drive on
 # Colab, where the local filesystem is wiped on every disconnect).
+# Yahoo fingerprints the TLS handshake, not just the User-Agent, so a plain
+# requests session gets blocked from shared hosts (Streamlit Cloud, CI runners).
+# curl_cffi impersonates a real Chrome handshake and gets through far more often.
+def _make_session():
+    try:
+        from curl_cffi import requests as cffi
+        return cffi.Session(impersonate="chrome")
+    except Exception:
+        return None
+
+
+YF_SESSION = _make_session()
+
+
+def yticker(sym):
+    """yf.Ticker with the impersonating session when available."""
+    try:
+        return yf.Ticker(sym, session=YF_SESSION) if YF_SESSION else yf.Ticker(sym)
+    except TypeError:                       # older yfinance without session kwarg
+        return yf.Ticker(sym)
+
+
 SNAP_DIR = Path(os.environ.get("SNAP_DIR", "snapshots"))
 SNAP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -157,21 +179,47 @@ def load_universe():
     return _clean(NDX_SNAPSHOT), f"built-in snapshot ({NDX_SNAPSHOT_DATE})"
 
 
-def list_expiries(refs=("AAPL", "NVDA", "MSFT")):
-    """Union of expiries across a few liquid names. Cached 1h."""
-    seen = set()
-    for r in refs:
-        try:
-            seen.update(yf.Ticker(r).options or [])
-        except Exception:
-            continue
+def upcoming_fridays(n=12):
+    """Generate the next n Fridays locally — no network needed."""
     today = pd.Timestamp.utcnow().tz_localize(None).normalize()
-    out = []
+    days = (4 - today.weekday()) % 7
+    first = today + pd.Timedelta(days=days)
+    return [(first + pd.Timedelta(weeks=i)).strftime("%Y-%m-%d") for i in range(n)]
+
+
+def list_expiries(refs=("AAPL", "NVDA", "MSFT", "SPY"), tries=2):
+    """Union of expiries across liquid names. Falls back to generated Fridays.
+
+    Returns (rows, live) where rows is [(date, dte, weekday)] and live says
+    whether Yahoo actually answered.
+    """
+    seen, live = set(), False
+    for attempt in range(tries):
+        for r in refs:
+            try:
+                opts = yticker(r).options or []
+                if opts:
+                    seen.update(opts)
+                    live = True
+            except Exception:
+                continue
+        if seen:
+            break
+        time.sleep(1.5 * (attempt + 1))
+
+    if not seen:
+        # US equity weeklies expire Fridays; monthlies are the 3rd Friday. Offering
+        # the calendar keeps the app usable — a date the name doesn't list simply
+        # gets rejected per-ticker at screen time.
+        seen = set(upcoming_fridays())
+
+    today = pd.Timestamp.utcnow().tz_localize(None).normalize()
+    rows = []
     for e in sorted(seen):
         d = (pd.Timestamp(e) - today).days
         if 0 <= d <= 400:
-            out.append((e, d, pd.Timestamp(e).day_name()[:3]))
-    return out
+            rows.append((e, d, pd.Timestamp(e).day_name()[:3]))
+    return rows, live
 
 
 # ══════════════════════════════════════════════════════════ screening
@@ -228,7 +276,7 @@ def _rej(reason):
 
 def screen_one(sym, expiry, cfg):
     """One ticker against one specific expiry date."""
-    tk = yf.Ticker(sym)
+    tk = yticker(sym)
 
     hist = _history(tk)
     if hist.empty:
@@ -238,12 +286,14 @@ def screen_one(sym, expiry, cfg):
     closes = hist["Close"]
     spot = float(closes.iloc[-1])
 
+    # If the expiry list is reachable, use it to skip a wasted chain call.
+    # If it isn't, try the chain anyway — it errors cleanly when unlisted.
     try:
         avail = tk.options or []
-    except Exception as e:
-        return _rej(f"options list raised {type(e).__name__}")
-    if expiry not in avail:
-        return _rej("does not list this expiry")
+        if avail and expiry not in avail:
+            return _rej("does not list this expiry")
+    except Exception:
+        pass
 
     today = pd.Timestamp.utcnow().tz_localize(None).normalize()
     dte = (pd.Timestamp(expiry) - today).days
@@ -251,6 +301,8 @@ def screen_one(sym, expiry, cfg):
 
     try:
         chain = tk.option_chain(expiry)
+    except ValueError:
+        return _rej("does not list this expiry")
     except Exception as e:
         return _rej(f"chain fetch raised {type(e).__name__}")
     calls, puts = chain.calls, chain.puts
@@ -428,3 +480,17 @@ def snapshot_movers(df, expiry):
     return m.sort_values("prem_rel_chg", ascending=False), ts
 
 
+
+
+def yahoo_reachable(sym="AAPL"):
+    """Quick probe: (ok, detail). Used by the dashboard to explain a dead feed."""
+    try:
+        h = yticker(sym).history(period="5d", auto_adjust=True)
+        if h.empty:
+            return False, "history returned empty (blocked or rate-limited)"
+        opts = yticker(sym).options or []
+        if not opts:
+            return False, "price data OK but no option expiries returned"
+        return True, f"OK — {len(h)} bars, {len(opts)} expiries"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {str(e)[:90]}"
