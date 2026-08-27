@@ -1,0 +1,42 @@
+name: Record premium snapshot
+
+on:
+  schedule:
+    # Every 30 min during US market hours (13:30-20:00 UTC), Mon-Fri.
+    # GitHub cron is UTC and does not follow daylight saving, so shift by an
+    # hour in winter if you want this pinned to the exact session.
+    - cron: "0,30 13-20 * * 1-5"
+  workflow_dispatch:        # lets you trigger it by hand from the Actions tab
+
+permissions:
+  contents: write           # needed to commit the snapshot back
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Take snapshot
+        run: python record_snapshot.py
+        continue-on-error: true      # a rate-limited run shouldn't fail the repo
+
+      - name: Commit
+        run: |
+          git config user.name  "snapshot-bot"
+          git config user.email "actions@github.com"
+          git add snapshots/
+          if git diff --staged --quiet; then
+            echo "no new snapshot"
+          else
+            git commit -m "snapshot $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git pull --rebase --autostash origin ${{ github.ref_name }} || true
+            git push
+          fi
