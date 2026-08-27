@@ -19,7 +19,7 @@ import yfinance as yf
 
 from core import (SNAP_DIR, _clean, add_flags, list_expiries as _list_expiries,
                   load_universe as _load_universe, load_snapshots, run_screen as _run_screen,
-                  save_snapshot, snapshot_movers)
+                  save_snapshot, snapshot_movers, yahoo_reachable)
 
 st.set_page_config(page_title="NDX Premium Screener", page_icon="◱", layout="wide")
 
@@ -49,10 +49,10 @@ universe, uni_src = load_universe()
 with st.sidebar:
     st.header("Settings")
 
-    exps = list_expiries()
-    if not exps:
-        st.error("No expiries returned — Yahoo may be blocking. Try again shortly.")
-        st.stop()
+    exps, live_exp = list_expiries()
+    if not live_exp:
+        st.warning("Yahoo didn't return an expiry list — showing the next 12 Fridays "
+                   "instead. Names that don't list a date get skipped at screen time.")
 
     labels = [f"{e}  ({wd}, {d}d)" for e, d, wd in exps]
     fridays = [i for i, (e, d, wd) in enumerate(exps) if wd == "Fri" and d >= 1]
@@ -82,6 +82,16 @@ with st.sidebar:
         max_spread = st.slider("Max bid-ask spread", 0.05, 1.0, 0.25, 0.05)
         workers = st.slider("Parallel workers", 1, 8, 4,
                             help="Above ~4 Yahoo starts rate-limiting")
+
+    with st.expander("Data source check"):
+        if st.button("Test Yahoo connection", use_container_width=True):
+            ok, detail = yahoo_reachable()
+            (st.success if ok else st.error)(detail)
+            if not ok:
+                st.caption("Streamlit Cloud shares outbound IPs with many apps and "
+                           "Yahoo rate-limits them. Retrying often works. If it's "
+                           "persistent, swap `screen_one` in core.py onto a keyed "
+                           "feed — Tradier's sandbox is free and gives full chains.")
 
     go = st.button("Run screen", type="primary", use_container_width=True)
     fresh = st.button("Force refresh (bypass 5-min cache)",
