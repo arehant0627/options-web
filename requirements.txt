@@ -1,0 +1,9 @@
+# Pinned to major versions. Unpinned deps are why a working app breaks on reboot:
+# Streamlit Cloud reinstalls on every restart and silently picks up new releases.
+streamlit>=1.40,<2
+yfinance>=1.6,<2
+pandas>=2.2,<3
+numpy>=1.26,<3
+requests>=2.31,<3
+lxml>=5.0,<7
+curl_cffi>=0.7,<1
